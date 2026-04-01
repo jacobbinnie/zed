@@ -4,7 +4,7 @@ use acp_thread::ThreadStatus;
 use action_log::DiffStats;
 use agent_client_protocol::{self as acp};
 use agent_settings::AgentSettings;
-use agent_ui::thread_metadata_store::{ThreadMetadata, ThreadMetadataStore};
+use agent_ui::thread_metadata_store::{ArchivedGitWorktree, ThreadMetadata, ThreadMetadataStore};
 use agent_ui::threads_archive_view::{
     ThreadsArchiveView, ThreadsArchiveViewEvent, format_history_entry_timestamp,
 };
@@ -15,14 +15,16 @@ use agent_ui::{
 use chrono::{DateTime, Utc};
 use editor::Editor;
 use feature_flags::{AgentV2FeatureFlag, FeatureFlagViewExt as _};
+use git::repository::{AskPassDelegate, CommitOptions, ResetMode};
 use gpui::{
-    Action as _, AnyElement, App, Context, Entity, FocusHandle, Focusable, KeyContext, ListState,
-    Pixels, Render, SharedString, WeakEntity, Window, WindowHandle, linear_color_stop,
-    linear_gradient, list, prelude::*, px,
+    Action as _, AnyElement, App, AsyncWindowContext, Context, Entity, FocusHandle, Focusable,
+    KeyContext, ListState, Pixels, PromptLevel, Render, SharedString, Task, WeakEntity, Window,
+    WindowHandle, linear_color_stop, linear_gradient, list, prelude::*, px,
 };
 use menu::{
     Cancel, Confirm, SelectChild, SelectFirst, SelectLast, SelectNext, SelectParent, SelectPrevious,
 };
+use project::git_store;
 use project::{AgentId, AgentRegistryStore, Event as ProjectEvent, linked_worktree_short_name};
 use recent_projects::sidebar_recent_projects::SidebarRecentProjects;
 use remote::RemoteConnectionOptions;
@@ -32,6 +34,7 @@ use serde::{Deserialize, Serialize};
 use settings::Settings as _;
 use std::collections::{HashMap, HashSet};
 use std::mem;
+use std::path::PathBuf;
 use std::rc::Rc;
 use theme::ActiveTheme;
 use ui::{
@@ -381,6 +384,26 @@ pub struct Sidebar {
     project_header_menu_ix: Option<usize>,
     _subscriptions: Vec<gpui::Subscription>,
     _draft_observation: Option<gpui::Subscription>,
+    pending_worktree_archives: HashMap<PathBuf, Task<anyhow::Result<()>>>,
+}
+
+fn find_main_repo_in_workspaces(
+    workspaces: &[Entity<Workspace>],
+    main_repo_path: &std::path::Path,
+    cx: &App,
+) -> Option<Entity<git_store::Repository>> {
+    workspaces.iter().find_map(|workspace| {
+        let project = workspace.read(cx).project().clone();
+        project
+            .read(cx)
+            .repositories(cx)
+            .values()
+            .find_map(|repo_entity| {
+                let repo = repo_entity.read(cx);
+                (repo.is_main_worktree() && *repo.work_directory_abs_path == *main_repo_path)
+                    .then(|| repo_entity.clone())
+            })
+    })
 }
 
 impl Sidebar {
@@ -472,6 +495,7 @@ impl Sidebar {
             project_header_menu_ix: None,
             _subscriptions: Vec::new(),
             _draft_observation: None,
+            pending_worktree_archives: HashMap::default(),
         }
     }
 
@@ -2167,16 +2191,38 @@ impl Sidebar {
         ThreadMetadataStore::global(cx)
             .update(cx, |store, cx| store.unarchive(&metadata.session_id, cx));
 
+        if metadata.folder_paths.paths().is_empty() {
+            self.activate_unarchived_thread_in_workspace(&metadata, window, cx);
+            return;
+        }
+
+        // Check all paths for archived worktrees that may need restoration
+        // before opening the workspace.
+        let paths = metadata.folder_paths.paths().to_vec();
+        self.maybe_restore_git_worktrees(paths, metadata, window, cx);
+    }
+
+    fn activate_unarchived_thread_in_workspace(
+        &mut self,
+        metadata: &ThreadMetadata,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         if !metadata.folder_paths.paths().is_empty() {
             let path_list = metadata.folder_paths.clone();
             if let Some(workspace) = self.find_current_workspace_for_path_list(&path_list, cx) {
-                self.activate_thread_locally(&metadata, &workspace, window, cx);
+                self.activate_thread_locally(metadata, &workspace, window, cx);
             } else if let Some((target_window, workspace)) =
                 self.find_open_workspace_for_path_list(&path_list, cx)
             {
-                self.activate_thread_in_other_window(metadata, workspace, target_window, cx);
+                self.activate_thread_in_other_window(
+                    metadata.clone(),
+                    workspace,
+                    target_window,
+                    cx,
+                );
             } else {
-                self.open_workspace_and_activate_thread(metadata, path_list, window, cx);
+                self.open_workspace_and_activate_thread(metadata.clone(), path_list, window, cx);
             }
             return;
         }
@@ -2189,8 +2235,445 @@ impl Sidebar {
         });
 
         if let Some(workspace) = active_workspace {
-            self.activate_thread_locally(&metadata, &workspace, window, cx);
+            self.activate_thread_locally(metadata, &workspace, window, cx);
         }
+    }
+
+    fn maybe_restore_git_worktrees(
+        &mut self,
+        paths: Vec<std::path::PathBuf>,
+        metadata: ThreadMetadata,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        // Cancel any in-flight archive tasks for the paths we're about to
+        // restore, so a slow archive cannot delete a worktree we are restoring.
+        let canceled_paths: Vec<_> = paths
+            .iter()
+            .filter(|path| self.pending_worktree_archives.remove(*path).is_some())
+            .cloned()
+            .collect();
+
+        let Some(multi_workspace) = self.multi_workspace.upgrade() else {
+            return;
+        };
+        let workspaces = multi_workspace.read(cx).workspaces().to_vec();
+
+        cx.spawn_in(window, async move |this, cx| {
+            let store = cx.update(|_window, cx| ThreadMetadataStore::global(cx))?;
+
+            for canceled_path in &canceled_paths {
+                let path_str = canceled_path.to_string_lossy().to_string();
+                let archived_worktree = store
+                    .update(cx, |store, cx| {
+                        store.get_archived_worktree_by_path(path_str, cx)
+                    })
+                    .await;
+                if let Ok(Some(row)) = archived_worktree {
+                    Self::maybe_cleanup_archived_worktree(&row, &store, &workspaces, cx).await;
+                }
+            }
+
+            let mut final_paths = Vec::with_capacity(paths.len());
+
+            for path in &paths {
+                let path_str = path.to_string_lossy().to_string();
+                let archived_worktree = match store
+                    .update(cx, |store, cx| {
+                        store.get_archived_worktree_by_path(path_str, cx)
+                    })
+                    .await
+                {
+                    Ok(row) => row,
+                    Err(err) => {
+                        log::error!(
+                            "Failed to query archived worktree for {}: {err}",
+                            path.display()
+                        );
+                        final_paths.push(path.clone());
+                        continue;
+                    }
+                };
+
+                match archived_worktree {
+                    None => {
+                        final_paths.push(path.clone());
+                    }
+                    Some(row) => {
+                        match Self::restore_archived_worktree(&row, &workspaces, cx).await {
+                            Ok(restored_path) => {
+                                final_paths.push(restored_path);
+                                Self::maybe_cleanup_archived_worktree(
+                                    &row,
+                                    &store,
+                                    &workspaces,
+                                    cx,
+                                )
+                                .await;
+                            }
+                            Err(err) => {
+                                log::error!(
+                                    "Failed to restore archived worktree for {}: {err}",
+                                    path.display()
+                                );
+                                final_paths.push(path.clone());
+                            }
+                        }
+                    }
+                }
+            }
+
+            let mut updated_metadata = metadata;
+            updated_metadata.folder_paths = PathList::new(&final_paths);
+
+            this.update_in(cx, |this, window, cx| {
+                this.activate_unarchived_thread_in_workspace(&updated_metadata, window, cx);
+            })?;
+
+            anyhow::Ok(())
+        })
+        .detach_and_log_err(cx);
+    }
+
+    async fn restore_archived_worktree(
+        row: &ArchivedGitWorktree,
+        workspaces: &[Entity<Workspace>],
+        cx: &mut AsyncWindowContext,
+    ) -> anyhow::Result<PathBuf> {
+        let commit_hash = row.commit_hash.clone();
+
+        // Find the main repo entity.
+        let main_repo = cx.update(|_window, cx| {
+            find_main_repo_in_workspaces(workspaces, &row.main_repo_path, cx)
+        })?;
+
+        let Some(main_repo) = main_repo else {
+            // Main repo not found — fall back to fresh worktree.
+            return Self::create_fresh_worktree(row, workspaces, cx).await;
+        };
+
+        // Check if the original worktree path is already in use.
+        let worktree_path = &row.worktree_path;
+        let fs = cx.update(|_window, cx| <dyn fs::Fs>::global(cx))?;
+        let already_exists = fs.metadata(worktree_path).await?.is_some();
+
+        let is_restored_and_valid = already_exists
+            && row.restored
+            && cx.update(|_window, cx| {
+                workspaces.iter().any(|workspace| {
+                    let project = workspace.read(cx).project().clone();
+                    project
+                        .read(cx)
+                        .repositories(cx)
+                        .values()
+                        .any(|repo_entity| {
+                            *repo_entity.read(cx).snapshot().work_directory_abs_path
+                                == *worktree_path
+                        })
+                })
+            })?;
+
+        let final_worktree_path = if !already_exists {
+            worktree_path.clone()
+        } else if is_restored_and_valid {
+            // Another thread already restored this worktree and it's
+            // registered as a git worktree in the project — reuse it.
+            worktree_path.clone()
+        } else {
+            // Collision — use a different path. Generate a name based on
+            // the archived worktree ID to keep it deterministic.
+            let new_name = format!(
+                "{}-restored-{}",
+                row.branch_name.as_deref().unwrap_or("worktree"),
+                row.id
+            );
+            let path = main_repo.update(cx, |repo, _cx| {
+                let setting = git_store::worktrees_directory_for_repo(
+                    &repo.snapshot().original_repo_abs_path,
+                    git::repository::DEFAULT_WORKTREE_DIRECTORY,
+                )
+                .ok()
+                .map(|p| p.to_string_lossy().to_string())
+                .unwrap_or_default();
+                repo.path_for_new_linked_worktree(&new_name, &setting)
+            })?;
+            path
+        };
+
+        // We need to create the worktree if it doesn't already exist at
+        // the final path (which may differ from the original due to a
+        // collision). If another thread already restored it and it's a
+        // recognized worktree, we skip creation.
+        let final_path_exists = if final_worktree_path == *worktree_path {
+            already_exists
+        } else {
+            fs.metadata(&final_worktree_path).await?.is_some()
+        };
+
+        if !final_path_exists && !is_restored_and_valid {
+            // Create the worktree in detached HEAD mode at the WIP commit.
+            let create_receiver = main_repo.update(cx, |repo, _cx| {
+                repo.create_worktree_detached(final_worktree_path.clone(), commit_hash.clone())
+            });
+            match create_receiver.await {
+                Ok(Ok(())) => {}
+                Ok(Err(err)) => {
+                    // Another concurrent restore may have already created
+                    // this worktree. Re-check before falling back.
+                    if fs.metadata(&final_worktree_path).await?.is_some() {
+                        log::info!("Worktree creation failed ({err}) but path exists — reusing it");
+                    } else {
+                        log::error!("Failed to create worktree: {err}");
+                        return Self::create_fresh_worktree(row, workspaces, cx).await;
+                    }
+                }
+                Err(_) => {
+                    anyhow::bail!("Worktree creation was canceled");
+                }
+            }
+
+            // Tell the project about the new worktree and wait for it
+            // to finish scanning so the GitStore creates a Repository.
+            let project = cx.update(|_window, cx| {
+                workspaces.iter().find_map(|workspace| {
+                    let project = workspace.read(cx).project().clone();
+                    let has_main_repo = project.read(cx).repositories(cx).values().any(|repo| {
+                        let repo = repo.read(cx);
+                        repo.is_main_worktree()
+                            && *repo.work_directory_abs_path == *row.main_repo_path
+                    });
+                    has_main_repo.then_some(project)
+                })
+            })?;
+
+            if let Some(project) = project {
+                let path_for_register = final_worktree_path.clone();
+                let worktree_result = project
+                    .update(cx, |project, cx| {
+                        project.find_or_create_worktree(path_for_register, true, cx)
+                    })
+                    .await;
+                if let Ok((worktree, _)) = worktree_result {
+                    let scan_complete = cx.update(|_window, cx| {
+                        worktree
+                            .read(cx)
+                            .as_local()
+                            .map(project::LocalWorktree::scan_complete)
+                    })?;
+                    if let Some(future) = scan_complete {
+                        future.await;
+                    }
+                }
+            }
+
+            // Find the new worktree's repo entity.
+            let worktree_repo = cx.update(|_window, cx| {
+                workspaces.iter().find_map(|workspace| {
+                    let project = workspace.read(cx).project().clone();
+                    project
+                        .read(cx)
+                        .repositories(cx)
+                        .values()
+                        .find_map(|repo_entity| {
+                            let snapshot = repo_entity.read(cx).snapshot();
+                            (*snapshot.work_directory_abs_path == *final_worktree_path)
+                                .then(|| repo_entity.clone())
+                        })
+                })
+            })?;
+
+            if let Some(worktree_repo) = worktree_repo {
+                let resets_ok = 'resets: {
+                    let mixed_reset = worktree_repo.update(cx, |repo, cx| {
+                        repo.reset("HEAD~".to_string(), ResetMode::Mixed, cx)
+                    });
+                    match mixed_reset.await {
+                        Ok(Ok(())) => {}
+                        Ok(Err(err)) => {
+                            log::warn!("Failed to mixed-reset WIP unstaged commit: {err}");
+                            break 'resets false;
+                        }
+                        Err(_) => {
+                            log::warn!("Mixed reset was canceled");
+                            break 'resets false;
+                        }
+                    }
+
+                    let soft_reset = worktree_repo.update(cx, |repo, cx| {
+                        repo.reset("HEAD~".to_string(), ResetMode::Soft, cx)
+                    });
+                    match soft_reset.await {
+                        Ok(Ok(())) => {}
+                        Ok(Err(err)) => {
+                            log::warn!("Failed to soft-reset WIP staged commit: {err}");
+                            // Attempt to undo the mixed reset to return to the WIP commit.
+                            let undo = worktree_repo.update(cx, |repo, cx| {
+                                repo.reset(commit_hash.clone(), ResetMode::Mixed, cx)
+                            });
+                            match undo.await {
+                                Ok(Ok(())) => {
+                                    log::info!("Undid mixed reset after soft-reset failure")
+                                }
+                                Ok(Err(undo_err)) => {
+                                    log::warn!("Could not undo mixed reset: {undo_err}")
+                                }
+                                Err(_) => log::warn!("Undo of mixed reset was canceled"),
+                            }
+                            break 'resets false;
+                        }
+                        Err(_) => {
+                            log::warn!("Soft reset was canceled");
+                            // Attempt to undo the mixed reset to return to the WIP commit.
+                            let undo = worktree_repo.update(cx, |repo, cx| {
+                                repo.reset(commit_hash.clone(), ResetMode::Mixed, cx)
+                            });
+                            match undo.await {
+                                Ok(Ok(())) => {
+                                    log::info!("Undid mixed reset after soft-reset cancellation")
+                                }
+                                Ok(Err(undo_err)) => {
+                                    log::warn!("Could not undo mixed reset: {undo_err}")
+                                }
+                                Err(_) => log::warn!("Undo of mixed reset was canceled"),
+                            }
+                            break 'resets false;
+                        }
+                    }
+
+                    true
+                };
+
+                if !resets_ok {
+                    log::warn!(
+                        "Staging state could not be fully restored for worktree; proceeding to mark as restored"
+                    );
+                } else if let Some(original_branch) = &row.branch_name {
+                    let switch_receiver = worktree_repo
+                        .update(cx, |repo, _cx| repo.change_branch(original_branch.clone()));
+                    let switch_ok = matches!(switch_receiver.await, Ok(Ok(())));
+
+                    if !switch_ok {
+                        // The branch may already exist but be checked out in
+                        // another worktree. Attempt to create it in case it
+                        // was deleted; if it already exists, just accept the
+                        // detached HEAD and warn.
+                        let create_receiver = worktree_repo.update(cx, |repo, _cx| {
+                            repo.create_branch(original_branch.clone(), None)
+                        });
+                        match create_receiver.await {
+                            Ok(Ok(())) => {}
+                            Ok(Err(_)) => {
+                                log::warn!(
+                                    "Could not switch to branch '{original_branch}' — \
+                                     it may be checked out in another worktree. \
+                                     The restored worktree is in detached HEAD state."
+                                );
+                            }
+                            Err(_) => {
+                                log::warn!(
+                                    "Branch creation for '{original_branch}' was canceled; \
+                                     the restored worktree is in detached HEAD state."
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Mark the archived worktree as restored in the database.
+            let store = cx.update(|_window, cx| ThreadMetadataStore::global(cx))?;
+            store
+                .update(cx, |store, cx| {
+                    store.update_archived_worktree_restored(
+                        row.id,
+                        final_worktree_path.to_string_lossy().to_string(),
+                        row.branch_name.clone(),
+                        cx,
+                    )
+                })
+                .await?;
+        }
+
+        Ok(final_worktree_path)
+    }
+
+    async fn create_fresh_worktree(
+        row: &ArchivedGitWorktree,
+        workspaces: &[Entity<Workspace>],
+        cx: &mut AsyncWindowContext,
+    ) -> anyhow::Result<PathBuf> {
+        // Find the main repo entity.
+        let main_repo = cx.update(|_window, cx| {
+            find_main_repo_in_workspaces(workspaces, &row.main_repo_path, cx)
+        })?;
+
+        let Some(main_repo) = main_repo else {
+            anyhow::bail!(
+                "Main repository at {} not found in any open workspace",
+                row.main_repo_path.display()
+            );
+        };
+
+        // Generate a new branch name for the fresh worktree.
+        let branch_name = format!("restored-{}", row.id);
+        let worktree_path = main_repo.update(cx, |repo, _cx| {
+            let setting = git_store::worktrees_directory_for_repo(
+                &repo.snapshot().original_repo_abs_path,
+                git::repository::DEFAULT_WORKTREE_DIRECTORY,
+            )
+            .ok()
+            .map(|p| p.to_string_lossy().to_string())
+            .unwrap_or_default();
+            repo.path_for_new_linked_worktree(&branch_name, &setting)
+        })?;
+
+        // Create the fresh worktree.
+        let create_receiver = main_repo.update(cx, |repo, _cx| {
+            repo.create_worktree(branch_name, worktree_path.clone(), None)
+        });
+        match create_receiver.await {
+            Ok(Ok(())) => {}
+            Ok(Err(err)) => {
+                anyhow::bail!("Failed to create fresh worktree: {err}");
+            }
+            Err(_) => {
+                anyhow::bail!("Fresh worktree creation was canceled");
+            }
+        }
+
+        log::warn!(
+            "Unable to restore the original git worktree. Created a fresh worktree instead."
+        );
+
+        Ok(worktree_path)
+    }
+
+    async fn maybe_cleanup_archived_worktree(
+        row: &ArchivedGitWorktree,
+        store: &Entity<ThreadMetadataStore>,
+        workspaces: &[Entity<Workspace>],
+        cx: &mut AsyncWindowContext,
+    ) {
+        // Delete the git ref from the main repo.
+        let Ok(main_repo) = cx.update(|_window, cx| {
+            find_main_repo_in_workspaces(workspaces, &row.main_repo_path, cx)
+        }) else {
+            return;
+        };
+
+        if let Some(main_repo) = main_repo {
+            let ref_name = format!("refs/archived-worktrees/{}", row.id);
+            let receiver = main_repo.update(cx, |repo, _cx| repo.delete_ref(ref_name));
+            if let Ok(result) = receiver.await {
+                result.log_err();
+            }
+        }
+
+        // Delete the archived worktree record.
+        store
+            .update(cx, |store, cx| store.delete_archived_worktree(row.id, cx))
+            .await
+            .log_err();
     }
 
     fn expand_selected_entry(
@@ -2445,6 +2928,539 @@ impl Sidebar {
                 }
             }
         }
+
+        self.maybe_delete_git_worktree_for_archived_thread(session_id, window, cx);
+    }
+
+    /// If the thread being archived is associated with a linked git worktree,
+    /// link it to an archived worktree record. If this is the last thread on
+    /// that worktree, create a WIP commit, anchor it with a git ref, and
+    /// delete the worktree.
+    fn maybe_delete_git_worktree_for_archived_thread(
+        &mut self,
+        session_id: &acp::SessionId,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let folder_paths = self.contents.entries.iter().find_map(|entry| {
+            if let ListEntry::Thread(t) = entry {
+                if &t.metadata.session_id == session_id {
+                    return Some(match &t.workspace {
+                        ThreadEntryWorkspace::Open(ws) => workspace_path_list(ws, cx),
+                        ThreadEntryWorkspace::Closed(path_list) => path_list.clone(),
+                    });
+                }
+            }
+            None
+        });
+
+        let Some(folder_paths) = folder_paths else {
+            return;
+        };
+
+        let Some(multi_workspace) = self.multi_workspace.upgrade() else {
+            return;
+        };
+        let workspaces = multi_workspace.read(cx).workspaces().to_vec();
+
+        let store_entity = ThreadMetadataStore::global(cx);
+        let is_last_thread = !store_entity
+            .read(cx)
+            .entries_for_path(&folder_paths)
+            .any(|entry| &entry.session_id != session_id);
+
+        // Collect info for each path that is a linked git worktree.
+        let mut linked_worktrees: Vec<(
+            Entity<git_store::Repository>,
+            PathBuf,
+            Option<String>,
+            std::sync::Arc<std::path::Path>,
+            Option<Entity<git_store::Repository>>,
+        )> = Vec::new();
+        for worktree_path in folder_paths.paths() {
+            if let Some(info) = workspaces.iter().find_map(|workspace| {
+                let project = workspace.read(cx).project().clone();
+                project
+                    .read(cx)
+                    .repositories(cx)
+                    .values()
+                    .find_map(|repo_entity| {
+                        let snapshot = repo_entity.read(cx).snapshot();
+                        if snapshot.is_linked_worktree()
+                            && *snapshot.work_directory_abs_path == *worktree_path
+                        {
+                            let branch_name =
+                                snapshot.branch.as_ref().map(|b| b.name().to_string());
+                            let main_repo_path = snapshot.original_repo_abs_path;
+                            let main_repo =
+                                find_main_repo_in_workspaces(&workspaces, &main_repo_path, cx);
+                            Some((
+                                repo_entity.clone(),
+                                worktree_path.clone(),
+                                branch_name,
+                                main_repo_path,
+                                main_repo,
+                            ))
+                        } else {
+                            None
+                        }
+                    })
+            }) {
+                linked_worktrees.push(info);
+            }
+        }
+
+        if linked_worktrees.is_empty() {
+            return;
+        }
+
+        let fs = <dyn fs::Fs>::global(cx);
+
+        for (worktree_repo, worktree_path, branch_name, main_repo_path, main_repo) in
+            linked_worktrees
+        {
+            let session_id = session_id.clone();
+            let folder_paths = folder_paths.clone();
+            let fs = fs.clone();
+            let worktree_path_key = worktree_path.clone();
+            let cleanup_key = worktree_path_key.clone();
+
+            let task = cx.spawn_in(window, async move |this, cx| {
+                let result = Self::archive_single_worktree(
+                    worktree_repo,
+                    worktree_path,
+                    branch_name,
+                    main_repo_path,
+                    main_repo,
+                    is_last_thread,
+                    session_id,
+                    folder_paths,
+                    fs,
+                    cx,
+                )
+                .await;
+                this.update_in(cx, |sidebar, _window, _cx| {
+                    sidebar.pending_worktree_archives.remove(&cleanup_key);
+                })
+                .log_err();
+                result
+            });
+            self.pending_worktree_archives
+                .insert(worktree_path_key, task);
+        }
+    }
+
+    async fn archive_single_worktree(
+        worktree_repo: Entity<git_store::Repository>,
+        worktree_path: PathBuf,
+        branch_name: Option<String>,
+        main_repo_path: std::sync::Arc<std::path::Path>,
+        main_repo: Option<Entity<git_store::Repository>>,
+        is_last_thread: bool,
+        session_id: acp::SessionId,
+        folder_paths: PathList,
+        fs: std::sync::Arc<dyn fs::Fs>,
+        cx: &mut AsyncWindowContext,
+    ) -> anyhow::Result<()> {
+        if !is_last_thread {
+            return anyhow::Ok(());
+        }
+
+        let store = cx.update(|_window, cx| ThreadMetadataStore::global(cx))?;
+
+        // Re-check inside the async block to narrow the TOCTOU window:
+        // another thread on the same worktree may have been un-archived
+        // (or a new one created) between the synchronous check and here.
+        // Note: this does not fully close the race — state can still change
+        // at subsequent await points during the commit/archive sequence.
+        let still_last_thread = store.update(cx, |store, _cx| {
+            !store
+                .entries_for_path(&folder_paths)
+                .any(|entry| &entry.session_id != &session_id)
+        });
+        if !still_last_thread {
+            return anyhow::Ok(());
+        }
+
+        // Helper: unarchive the thread so it reappears in the sidebar.
+        let unarchive = |cx: &mut AsyncWindowContext| {
+            store.update(cx, |store, cx| {
+                store.unarchive(&session_id, cx);
+            });
+        };
+
+        // Helper: undo both WIP commits on the worktree.
+        let undo_wip_commits = |cx: &mut AsyncWindowContext| {
+            let reset_receiver = worktree_repo.update(cx, |repo, cx| {
+                repo.reset("HEAD~2".to_string(), ResetMode::Mixed, cx)
+            });
+            async move {
+                match reset_receiver.await {
+                    Ok(Ok(())) => true,
+                    Ok(Err(err)) => {
+                        log::error!("Failed to undo WIP commits: {err}");
+                        false
+                    }
+                    Err(_) => {
+                        log::error!("WIP commit undo was canceled");
+                        false
+                    }
+                }
+            }
+        };
+
+        // === Last thread: two WIP commits, ref creation, and worktree deletion ===
+        //
+        // We create two commits to preserve the original staging state:
+        //   1. Commit whatever is currently staged (allow-empty).
+        //   2. Stage everything (including untracked), commit again (allow-empty).
+        //
+        // On restore, two resets undo this:
+        //   1. `git reset --mixed HEAD~`  — undoes commit 2, puts
+        //      previously-unstaged/untracked files back as unstaged.
+        //   2. `git reset --soft HEAD~`   — undoes commit 1, leaves
+        //      the index as-is so originally-staged files stay staged.
+        //
+        // If any step in this sequence fails, we undo everything and
+        // bail out.
+
+        // Step 1: commit whatever is currently staged.
+        let askpass = AskPassDelegate::new(cx, |_, _, _| {});
+        let first_commit_result = worktree_repo.update(cx, |repo, cx| {
+            repo.commit(
+                "WIP staged".into(),
+                None,
+                CommitOptions {
+                    allow_empty: true,
+                    ..Default::default()
+                },
+                askpass,
+                cx,
+            )
+        });
+        let first_commit_ok = match first_commit_result.await {
+            Ok(Ok(())) => true,
+            Ok(Err(err)) => {
+                log::error!("Failed to create first WIP commit (staged): {err}");
+                false
+            }
+            Err(_) => {
+                log::error!("First WIP commit was canceled");
+                false
+            }
+        };
+
+        // Step 2: stage everything including untracked, then commit.
+        // If anything fails after the first commit, undo it and bail.
+        let commit_ok = if first_commit_ok {
+            let stage_result =
+                worktree_repo.update(cx, |repo, _cx| repo.stage_all_including_untracked());
+            let stage_ok = match stage_result.await {
+                Ok(Ok(())) => true,
+                Ok(Err(err)) => {
+                    log::error!("Failed to stage worktree files: {err}");
+                    false
+                }
+                Err(_) => {
+                    log::error!("Stage operation was canceled");
+                    false
+                }
+            };
+
+            if !stage_ok {
+                let undo = worktree_repo.update(cx, |repo, cx| {
+                    repo.reset("HEAD~".to_string(), ResetMode::Mixed, cx)
+                });
+                match undo.await {
+                    Ok(Ok(())) => {}
+                    Ok(Err(err)) => log::error!("Failed to undo first WIP commit: {err}"),
+                    Err(_) => log::error!("Undo of first WIP commit was canceled"),
+                }
+                false
+            } else {
+                let askpass = AskPassDelegate::new(cx, |_, _, _| {});
+                let second_commit_result = worktree_repo.update(cx, |repo, cx| {
+                    repo.commit(
+                        "WIP unstaged".into(),
+                        None,
+                        CommitOptions {
+                            allow_empty: true,
+                            ..Default::default()
+                        },
+                        askpass,
+                        cx,
+                    )
+                });
+                match second_commit_result.await {
+                    Ok(Ok(())) => true,
+                    Ok(Err(err)) => {
+                        log::error!("Failed to create second WIP commit (unstaged): {err}");
+                        let undo = worktree_repo.update(cx, |repo, cx| {
+                            repo.reset("HEAD~".to_string(), ResetMode::Mixed, cx)
+                        });
+                        match undo.await {
+                            Ok(Ok(())) => {}
+                            Ok(Err(err)) => {
+                                log::error!("Failed to undo first WIP commit: {err}")
+                            }
+                            Err(_) => {
+                                log::error!("Undo of first WIP commit was canceled")
+                            }
+                        }
+                        false
+                    }
+                    Err(_) => {
+                        log::error!("Second WIP commit was canceled");
+                        let undo = worktree_repo.update(cx, |repo, cx| {
+                            repo.reset("HEAD~".to_string(), ResetMode::Mixed, cx)
+                        });
+                        match undo.await {
+                            Ok(Ok(())) => {}
+                            Ok(Err(err)) => {
+                                log::error!("Failed to undo first WIP commit: {err}")
+                            }
+                            Err(_) => {
+                                log::error!("Undo of first WIP commit was canceled")
+                            }
+                        }
+                        false
+                    }
+                }
+            }
+        } else {
+            false
+        };
+
+        let worktree_path_str = worktree_path.to_string_lossy().to_string();
+        let main_repo_path_str = main_repo_path.to_string_lossy().to_string();
+
+        let mut archived_row_id: Option<i64> = None;
+
+        if !commit_ok {
+            // Show a prompt asking the user what to do.
+            let answer = cx.prompt(
+                PromptLevel::Warning,
+                "Failed to save worktree state",
+                Some(
+                    "Could not create a WIP commit for this worktree. \
+                     If you proceed, the worktree will be deleted and \
+                     unarchiving this thread later will not restore the \
+                     filesystem to its previous state.\n\n\
+                     Cancel to keep the worktree on disk so you can \
+                     resolve the issue manually.",
+                ),
+                &["Delete Anyway", "Cancel"],
+            );
+
+            match answer.await {
+                Ok(0) => {
+                    // "Delete Anyway" — proceed to worktree deletion
+                    // without a WIP commit or DB record.
+                }
+                _ => {
+                    // "Cancel" — undo the archive so the thread
+                    // reappears in the sidebar.
+                    unarchive(cx);
+                    return anyhow::Ok(());
+                }
+            }
+        } else {
+            // Commit succeeded — get hash, create archived worktree row, create ref.
+            let head_sha_result = worktree_repo.update(cx, |repo, _cx| repo.head_sha());
+            let commit_hash = match head_sha_result.await {
+                Ok(Ok(Some(sha))) => sha,
+                sha_result => {
+                    let reason = match &sha_result {
+                        Ok(Ok(None)) => "HEAD SHA is None".into(),
+                        Ok(Err(err)) => format!("Failed to get HEAD SHA: {err}"),
+                        Err(_) => "HEAD SHA operation was canceled".into(),
+                        Ok(Ok(Some(_))) => unreachable!(),
+                    };
+                    log::error!("{reason} after WIP commits; attempting to undo");
+                    let undo_ok = undo_wip_commits(cx).await;
+                    unarchive(cx);
+                    let detail = if undo_ok {
+                        "Could not read the commit hash after creating \
+                         the WIP commit. The commit has been undone and \
+                         the thread has been restored to the sidebar."
+                    } else {
+                        "Could not read the commit hash after creating \
+                         the WIP commit. The commit could not be automatically \
+                         undone \u{2014} you may need to manually run `git reset HEAD~2` \
+                         on the worktree. The thread has been restored to the sidebar."
+                    };
+                    cx.prompt(
+                        PromptLevel::Warning,
+                        "Failed to archive worktree",
+                        Some(detail),
+                        &["OK"],
+                    )
+                    .await
+                    .ok();
+                    return anyhow::Ok(());
+                }
+            };
+
+            let row_id_result = store
+                .update(cx, |store, cx| {
+                    store.create_archived_worktree(
+                        worktree_path_str,
+                        main_repo_path_str,
+                        branch_name,
+                        commit_hash.clone(),
+                        cx,
+                    )
+                })
+                .await;
+
+            match row_id_result {
+                Ok(row_id) => {
+                    archived_row_id = Some(row_id);
+
+                    // Create a git ref on the main repo (non-fatal if
+                    // this fails — the commit hash is in the DB).
+                    if let Some(main_repo) = &main_repo {
+                        let ref_name = format!("refs/archived-worktrees/{row_id}");
+                        let ref_result = main_repo
+                            .update(cx, |repo, _cx| repo.update_ref(ref_name, commit_hash));
+                        match ref_result.await {
+                            Ok(Ok(())) => {}
+                            Ok(Err(err)) => {
+                                log::warn!("Failed to create archive ref: {err}")
+                            }
+                            Err(_) => log::warn!("Archive ref creation was canceled"),
+                        }
+                    }
+                }
+                Err(err) => {
+                    log::error!("Failed to create archived worktree record: {err}");
+                    let undo_ok = undo_wip_commits(cx).await;
+                    unarchive(cx);
+                    let detail = if undo_ok {
+                        "Could not save the archived worktree record. \
+                         The WIP commit has been undone and the thread \
+                         has been restored to the sidebar."
+                    } else {
+                        "Could not save the archived worktree record. \
+                         The WIP commit could not be automatically \
+                         undone \u{2014} you may need to manually run `git reset HEAD~2` \
+                         on the worktree. The thread has been restored to the sidebar."
+                    };
+                    cx.prompt(
+                        PromptLevel::Warning,
+                        "Failed to archive worktree",
+                        Some(detail),
+                        &["OK"],
+                    )
+                    .await
+                    .ok();
+                    return anyhow::Ok(());
+                }
+            }
+        }
+
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let temp_path = std::env::temp_dir().join(format!("zed-removing-worktree-{timestamp}"));
+
+        let dir_removed = if fs
+            .rename(
+                &worktree_path,
+                &temp_path,
+                fs::RenameOptions {
+                    overwrite: false,
+                    ..Default::default()
+                },
+            )
+            .await
+            .is_ok()
+        {
+            if let Some(main_repo) = &main_repo {
+                let receiver = main_repo.update(cx, |repo, _cx| {
+                    repo.remove_worktree(worktree_path.clone(), true)
+                });
+                if let Ok(result) = receiver.await {
+                    result.log_err();
+                }
+            }
+            fs.remove_dir(
+                &temp_path,
+                fs::RemoveOptions {
+                    recursive: true,
+                    ignore_if_not_exists: true,
+                },
+            )
+            .await
+            .log_err();
+            true
+        } else if fs
+            .remove_dir(
+                &worktree_path,
+                fs::RemoveOptions {
+                    recursive: true,
+                    ignore_if_not_exists: true,
+                },
+            )
+            .await
+            .is_ok()
+        {
+            if let Some(main_repo) = &main_repo {
+                let receiver = main_repo.update(cx, |repo, _cx| {
+                    repo.remove_worktree(worktree_path.clone(), true)
+                });
+                if let Ok(result) = receiver.await {
+                    result.log_err();
+                }
+            }
+            true
+        } else {
+            false
+        };
+
+        if !dir_removed {
+            let undo_ok = if commit_ok {
+                undo_wip_commits(cx).await
+            } else {
+                true
+            };
+            if let Some(row_id) = archived_row_id {
+                if let Some(main_repo) = &main_repo {
+                    let ref_name = format!("refs/archived-worktrees/{row_id}");
+                    let receiver = main_repo.update(cx, |repo, _cx| repo.delete_ref(ref_name));
+                    if let Ok(result) = receiver.await {
+                        result.log_err();
+                    }
+                }
+                store
+                    .update(cx, |store, cx| store.delete_archived_worktree(row_id, cx))
+                    .await
+                    .log_err();
+            }
+            unarchive(cx);
+            let detail = if undo_ok {
+                "Could not remove the worktree directory from disk. \
+                 Any WIP commits and archive records have been rolled \
+                 back, and the thread has been restored to the sidebar."
+            } else {
+                "Could not remove the worktree directory from disk. \
+                 The archive records have been rolled back, but the WIP \
+                 commits could not be automatically undone \u{2014} you may need \
+                 to manually run `git reset HEAD~2` on the worktree. \
+                 The thread has been restored to the sidebar."
+            };
+            cx.prompt(
+                PromptLevel::Warning,
+                "Failed to delete worktree",
+                Some(detail),
+                &["OK"],
+            )
+            .await
+            .ok();
+        }
+
+        anyhow::Ok(())
     }
 
     fn remove_selected_thread(
