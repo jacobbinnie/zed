@@ -450,15 +450,10 @@ impl ThreadMetadataStore {
     pub fn set_archived_worktree_restored(
         &self,
         id: i64,
-        worktree_path: String,
-        branch_name: Option<String>,
         cx: &mut Context<Self>,
     ) -> Task<anyhow::Result<()>> {
         let db = self.db.clone();
-        cx.background_spawn(async move {
-            db.set_archived_worktree_restored(id, &worktree_path, branch_name.as_deref())
-                .await
-        })
+        cx.background_spawn(async move { db.set_archived_worktree_restored(id).await })
     }
 
     fn new(db: ThreadMetadataDb, cx: &mut Context<Self>) -> Self {
@@ -814,24 +809,13 @@ impl ThreadMetadataDb {
         .await
     }
 
-    pub async fn set_archived_worktree_restored(
-        &self,
-        id: i64,
-        worktree_path: &str,
-        branch_name: Option<&str>,
-    ) -> anyhow::Result<()> {
-        let worktree_path = worktree_path.to_string();
-        let branch_name = branch_name.map(|s| s.to_string());
+    pub async fn set_archived_worktree_restored(&self, id: i64) -> anyhow::Result<()> {
         self.write(move |conn| {
             let mut stmt = Statement::prepare(
                 conn,
-                "UPDATE archived_git_worktrees \
-                 SET restored = 1, worktree_path = ?, branch_name = ? \
-                 WHERE id = ?",
+                "UPDATE archived_git_worktrees SET restored = 1 WHERE id = ?",
             )?;
-            let mut i = stmt.bind(&worktree_path, 1)?;
-            i = stmt.bind(&branch_name, i)?;
-            stmt.bind(&id, i)?;
+            stmt.bind(&id, 1)?;
             stmt.exec()
         })
         .await
