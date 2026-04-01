@@ -387,11 +387,8 @@ pub struct Sidebar {
     pending_worktree_archives: HashMap<PathBuf, Task<anyhow::Result<()>>>,
 }
 
-fn archived_worktree_ref_name(worktree_path: &std::path::Path) -> String {
-    use std::hash::{Hash, Hasher};
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    worktree_path.hash(&mut hasher);
-    format!("refs/archived-worktrees/{:x}", hasher.finish())
+fn archived_worktree_ref_name(id: i64) -> String {
+    format!("refs/archived-worktrees/{}", id)
 }
 
 fn find_main_repo_in_workspaces(
@@ -2265,58 +2262,45 @@ impl Sidebar {
             return;
         };
         let workspaces = multi_workspace.read(cx).workspaces().to_vec();
+        let session_id = metadata.session_id.0.to_string();
 
         cx.spawn_in(window, async move |this, cx| {
             let store = cx.update(|_window, cx| ThreadMetadataStore::global(cx))?;
 
+            // Look up all archived worktrees linked to this thread.
+            let archived_worktrees = store
+                .update(cx, |store, cx| {
+                    store.get_archived_worktrees_for_thread(session_id, cx)
+                })
+                .await
+                .unwrap_or_default();
+
+            // Build a map from worktree_path → ArchivedGitWorktree for quick lookup.
+            let archived_by_path: HashMap<PathBuf, ArchivedGitWorktree> = archived_worktrees
+                .into_iter()
+                .map(|row| (row.worktree_path.clone(), row))
+                .collect();
+
+            // Clean up any canceled in-flight archives that have DB records.
             for canceled_path in &canceled_paths {
-                let path_str = canceled_path.to_string_lossy().to_string();
-                let archived_worktree = store
-                    .update(cx, |store, cx| {
-                        store.get_archived_worktree_by_path(path_str, cx)
-                    })
-                    .await;
-                if let Ok(Some(row)) = archived_worktree {
-                    Self::maybe_cleanup_archived_worktree(&row, &store, &workspaces, cx).await;
+                if let Some(row) = archived_by_path.get(canceled_path) {
+                    Self::maybe_cleanup_archived_worktree(row, &store, &workspaces, cx).await;
                 }
             }
 
             let mut final_paths = Vec::with_capacity(paths.len());
 
             for path in &paths {
-                let path_str = path.to_string_lossy().to_string();
-                let archived_worktree = match store
-                    .update(cx, |store, cx| {
-                        store.get_archived_worktree_by_path(path_str, cx)
-                    })
-                    .await
-                {
-                    Ok(row) => row,
-                    Err(err) => {
-                        log::error!(
-                            "Failed to query archived worktree for {}: {err}",
-                            path.display()
-                        );
-                        final_paths.push(path.clone());
-                        continue;
-                    }
-                };
-
-                match archived_worktree {
+                match archived_by_path.get(path) {
                     None => {
                         final_paths.push(path.clone());
                     }
                     Some(row) => {
-                        match Self::restore_archived_worktree(&row, &workspaces, cx).await {
+                        match Self::restore_archived_worktree(row, &workspaces, cx).await {
                             Ok(restored_path) => {
                                 final_paths.push(restored_path);
-                                Self::maybe_cleanup_archived_worktree(
-                                    &row,
-                                    &store,
-                                    &workspaces,
-                                    cx,
-                                )
-                                .await;
+                                Self::maybe_cleanup_archived_worktree(row, &store, &workspaces, cx)
+                                    .await;
                             }
                             Err(err) => {
                                 log::error!(
@@ -2389,15 +2373,7 @@ impl Sidebar {
         } else {
             // Collision — use a different path. Generate a name based on
             // the archived worktree ID to keep it deterministic.
-            let suffix = {
-                use std::hash::{Hash, Hasher};
-                let mut hasher = std::collections::hash_map::DefaultHasher::new();
-                row.worktree_path.hash(&mut hasher);
-                format!("{:x}", hasher.finish())
-                    .chars()
-                    .take(8)
-                    .collect::<String>()
-            };
+            let suffix = row.id.to_string();
             let new_name = format!(
                 "{}-restored-{suffix}",
                 row.branch_name.as_deref().unwrap_or("worktree"),
@@ -2600,7 +2576,7 @@ impl Sidebar {
             store
                 .update(cx, |store, cx| {
                     store.update_archived_worktree_restored(
-                        row.worktree_path.to_string_lossy().to_string(),
+                        row.id,
                         final_worktree_path.to_string_lossy().to_string(),
                         row.branch_name.clone(),
                         cx,
@@ -2686,18 +2662,16 @@ impl Sidebar {
         };
 
         if let Some(main_repo) = main_repo {
-            let ref_name = archived_worktree_ref_name(&row.worktree_path);
+            let ref_name = archived_worktree_ref_name(row.id);
             let receiver = main_repo.update(cx, |repo, _cx| repo.delete_ref(ref_name));
             if let Ok(result) = receiver.await {
                 result.log_err();
             }
         }
 
-        // Delete the archived worktree record.
+        // Delete the archived worktree record (and join table entries).
         store
-            .update(cx, |store, cx| {
-                store.delete_archived_worktree(row.worktree_path.to_string_lossy().to_string(), cx)
-            })
+            .update(cx, |store, cx| store.delete_archived_worktree(row.id, cx))
             .await
             .log_err();
     }
@@ -3260,7 +3234,7 @@ impl Sidebar {
         let worktree_path_str = worktree_path.to_string_lossy().to_string();
         let main_repo_path_str = main_repo_path.to_string_lossy().to_string();
 
-        let mut archived_worktree_path: Option<String> = None;
+        let mut archived_worktree_id: Option<i64> = None;
 
         if !commit_ok {
             // Show a prompt asking the user what to do.
@@ -3340,13 +3314,21 @@ impl Sidebar {
                 .await;
 
             match create_result {
-                Ok(()) => {
-                    archived_worktree_path = Some(worktree_path_str);
+                Ok(id) => {
+                    archived_worktree_id = Some(id);
+
+                    // Link the current thread to the archived worktree record.
+                    store
+                        .update(cx, |store, cx| {
+                            store.link_thread_to_archived_worktree(session_id.0.to_string(), id, cx)
+                        })
+                        .await
+                        .log_err();
 
                     // Create a git ref on the main repo (non-fatal if
                     // this fails — the commit hash is in the DB).
                     if let Some(main_repo) = &main_repo {
-                        let ref_name = archived_worktree_ref_name(&worktree_path);
+                        let ref_name = archived_worktree_ref_name(id);
                         let ref_result = main_repo
                             .update(cx, |repo, _cx| repo.update_ref(ref_name, commit_hash));
                         match ref_result.await {
@@ -3451,18 +3433,16 @@ impl Sidebar {
             } else {
                 true
             };
-            if let Some(ref archived_path) = archived_worktree_path {
+            if let Some(id) = archived_worktree_id {
                 if let Some(main_repo) = &main_repo {
-                    let ref_name = archived_worktree_ref_name(&worktree_path);
+                    let ref_name = archived_worktree_ref_name(id);
                     let receiver = main_repo.update(cx, |repo, _cx| repo.delete_ref(ref_name));
                     if let Ok(result) = receiver.await {
                         result.log_err();
                     }
                 }
                 store
-                    .update(cx, |store, cx| {
-                        store.delete_archived_worktree(archived_path.clone(), cx)
-                    })
+                    .update(cx, |store, cx| store.delete_archived_worktree(id, cx))
                     .await
                     .log_err();
             }

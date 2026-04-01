@@ -4927,16 +4927,7 @@ async fn test_archive_and_restore_single_worktree(cx: &mut TestAppContext) {
     )
     .await;
 
-    // Seed the main repo's git state with a ref pointing at the WIP commit.
-    // The restore flow will use this to create a detached worktree.
     let wip_commit_hash = "fake-wip-sha-123";
-    let expected_ref_name = archived_worktree_ref_name(std::path::Path::new("/wt-feature"));
-    fs.with_git_state(std::path::Path::new("/project/.git"), false, |state| {
-        state
-            .refs
-            .insert(expected_ref_name.clone(), wip_commit_hash.into());
-    })
-    .unwrap();
 
     cx.update(|cx| <dyn fs::Fs>::set_global(fs.clone(), cx));
 
@@ -4971,8 +4962,8 @@ async fn test_archive_and_restore_single_worktree(cx: &mut TestAppContext) {
     cx.run_until_parked();
 
     // Create the archived worktree DB record (simulates what the archive flow
-    // would have written after making a WIP commit).
-    store
+    // would have written after making a WIP commit) and link it to the thread.
+    let archived_id = store
         .update_in(cx, |store, _window, cx| {
             store.create_archived_worktree(
                 "/wt-feature".to_string(),
@@ -4985,6 +4976,13 @@ async fn test_archive_and_restore_single_worktree(cx: &mut TestAppContext) {
         .await
         .expect("creating archived worktree record should succeed");
 
+    store
+        .update_in(cx, |store, _window, cx| {
+            store.link_thread_to_archived_worktree(session_id.0.to_string(), archived_id, cx)
+        })
+        .await
+        .expect("linking thread to archived worktree should succeed");
+
     // Verify pre-conditions: the worktree directory does not exist and the
     // DB record is present.
     assert!(
@@ -4994,19 +4992,30 @@ async fn test_archive_and_restore_single_worktree(cx: &mut TestAppContext) {
         "worktree directory should not exist before restore"
     );
 
-    let archived_row = store
+    let archived_rows = store
         .update_in(cx, |store, _window, cx| {
-            store.get_archived_worktree_by_path("/wt-feature".to_string(), cx)
+            store.get_archived_worktrees_for_thread(session_id.0.to_string(), cx)
         })
         .await
         .expect("DB query should succeed");
-    assert!(
-        archived_row.is_some(),
-        "archived worktree record should exist before restore"
+    assert_eq!(
+        archived_rows.len(),
+        1,
+        "expected exactly one archived worktree record before restore"
     );
-    let archived_row = archived_row.unwrap();
+    let archived_row = &archived_rows[0];
+    assert_eq!(archived_row.id, archived_id);
     assert_eq!(archived_row.commit_hash, wip_commit_hash);
     assert_eq!(archived_row.branch_name.as_deref(), Some("feature"));
+
+    // Now seed the git ref using the actual archived worktree ID.
+    let expected_ref_name = archived_worktree_ref_name(archived_id);
+    fs.with_git_state(std::path::Path::new("/project/.git"), false, |state| {
+        state
+            .refs
+            .insert(expected_ref_name.clone(), wip_commit_hash.into());
+    })
+    .unwrap();
 
     // Thread should be archived.
     cx.update(|_, cx| {
@@ -5062,15 +5071,15 @@ async fn test_archive_and_restore_single_worktree(cx: &mut TestAppContext) {
     );
 
     // 3. The archived worktree DB record should be cleaned up.
-    let archived_row_after = store
+    let archived_rows_after = store
         .update_in(cx, |store, _window, cx| {
-            store.get_archived_worktree_by_path("/wt-feature".to_string(), cx)
+            store.get_archived_worktrees_for_thread(session_id.0.to_string(), cx)
         })
         .await
         .expect("DB query should succeed");
     assert!(
-        archived_row_after.is_none(),
-        "expected archived worktree record to be deleted after restore"
+        archived_rows_after.is_empty(),
+        "expected archived worktree records to be empty after restore"
     );
 
     // 4. The git ref should have been cleaned up from the main repo.
