@@ -773,7 +773,7 @@ impl ThreadMetadataDb {
         self.write(move |conn| {
             let mut stmt = Statement::prepare(
                 conn,
-                "INSERT OR IGNORE INTO thread_archived_worktrees(\
+                "INSERT INTO thread_archived_worktrees(\
                      session_id, archived_worktree_id\
                  ) VALUES (?, ?)",
             )?;
