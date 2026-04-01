@@ -3315,15 +3315,43 @@ impl Sidebar {
 
             match create_result {
                 Ok(id) => {
-                    archived_worktree_id = Some(id);
-
                     // Link the current thread to the archived worktree record.
-                    store
+                    let link_result = store
                         .update(cx, |store, cx| {
                             store.link_thread_to_archived_worktree(session_id.0.to_string(), id, cx)
                         })
+                        .await;
+
+                    if let Err(err) = link_result {
+                        log::error!("Failed to link thread to archived worktree: {err}");
+                        store
+                            .update(cx, |store, cx| store.delete_archived_worktree(id, cx))
+                            .await
+                            .log_err();
+                        let undo_ok = undo_wip_commits(cx).await;
+                        unarchive(cx);
+                        let detail = if undo_ok {
+                            "Could not link the thread to the archived worktree record. \
+                             The WIP commit has been undone and the thread \
+                             has been restored to the sidebar."
+                        } else {
+                            "Could not link the thread to the archived worktree record. \
+                             The WIP commit could not be automatically \
+                             undone \u{2014} you may need to manually run `git reset HEAD~2` \
+                             on the worktree. The thread has been restored to the sidebar."
+                        };
+                        cx.prompt(
+                            PromptLevel::Warning,
+                            "Failed to archive worktree",
+                            Some(detail),
+                            &["OK"],
+                        )
                         .await
-                        .log_err();
+                        .ok();
+                        return anyhow::Ok(());
+                    }
+
+                    archived_worktree_id = Some(id);
 
                     // Create a git ref on the main repo (non-fatal if
                     // this fails — the commit hash is in the DB).
