@@ -2575,7 +2575,7 @@ impl Sidebar {
             let store = cx.update(|_window, cx| ThreadMetadataStore::global(cx))?;
             store
                 .update(cx, |store, cx| {
-                    store.set_archived_worktree_restored(
+                    store.restore_archived_worktree(
                         row.id,
                         final_worktree_path.to_string_lossy().to_string(),
                         row.branch_name.clone(),
