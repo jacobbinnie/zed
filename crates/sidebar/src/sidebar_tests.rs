@@ -4930,10 +4930,11 @@ async fn test_archive_and_restore_single_worktree(cx: &mut TestAppContext) {
     // Seed the main repo's git state with a ref pointing at the WIP commit.
     // The restore flow will use this to create a detached worktree.
     let wip_commit_hash = "fake-wip-sha-123";
+    let expected_ref_name = archived_worktree_ref_name(std::path::Path::new("/wt-feature"));
     fs.with_git_state(std::path::Path::new("/project/.git"), false, |state| {
         state
             .refs
-            .insert("refs/archived-worktrees/1".into(), wip_commit_hash.into());
+            .insert(expected_ref_name.clone(), wip_commit_hash.into());
     })
     .unwrap();
 
@@ -4971,7 +4972,7 @@ async fn test_archive_and_restore_single_worktree(cx: &mut TestAppContext) {
 
     // Create the archived worktree DB record (simulates what the archive flow
     // would have written after making a WIP commit).
-    let row_id = store
+    store
         .update_in(cx, |store, _window, cx| {
             store.create_archived_worktree(
                 "/wt-feature".to_string(),
@@ -5004,7 +5005,6 @@ async fn test_archive_and_restore_single_worktree(cx: &mut TestAppContext) {
         "archived worktree record should exist before restore"
     );
     let archived_row = archived_row.unwrap();
-    assert_eq!(archived_row.id, row_id);
     assert_eq!(archived_row.commit_hash, wip_commit_hash);
     assert_eq!(archived_row.branch_name.as_deref(), Some("feature"));
 
@@ -5076,9 +5076,7 @@ async fn test_archive_and_restore_single_worktree(cx: &mut TestAppContext) {
     // 4. The git ref should have been cleaned up from the main repo.
     fs.with_git_state(std::path::Path::new("/project/.git"), false, |state| {
         assert!(
-            !state
-                .refs
-                .contains_key(&format!("refs/archived-worktrees/{row_id}")),
+            !state.refs.contains_key(&expected_ref_name),
             "expected git ref to be deleted after restore, refs: {:?}",
             state.refs
         );

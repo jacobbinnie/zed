@@ -387,6 +387,13 @@ pub struct Sidebar {
     pending_worktree_archives: HashMap<PathBuf, Task<anyhow::Result<()>>>,
 }
 
+fn archived_worktree_ref_name(worktree_path: &std::path::Path) -> String {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    worktree_path.hash(&mut hasher);
+    format!("refs/archived-worktrees/{:x}", hasher.finish())
+}
+
 fn find_main_repo_in_workspaces(
     workspaces: &[Entity<Workspace>],
     main_repo_path: &std::path::Path,
@@ -2382,10 +2389,18 @@ impl Sidebar {
         } else {
             // Collision — use a different path. Generate a name based on
             // the archived worktree ID to keep it deterministic.
+            let suffix = {
+                use std::hash::{Hash, Hasher};
+                let mut hasher = std::collections::hash_map::DefaultHasher::new();
+                row.worktree_path.hash(&mut hasher);
+                format!("{:x}", hasher.finish())
+                    .chars()
+                    .take(8)
+                    .collect::<String>()
+            };
             let new_name = format!(
-                "{}-restored-{}",
+                "{}-restored-{suffix}",
                 row.branch_name.as_deref().unwrap_or("worktree"),
-                row.id
             );
             let path = main_repo.update(cx, |repo, _cx| {
                 let setting = git_store::worktrees_directory_for_repo(
@@ -2585,7 +2600,7 @@ impl Sidebar {
             store
                 .update(cx, |store, cx| {
                     store.update_archived_worktree_restored(
-                        row.id,
+                        row.worktree_path.to_string_lossy().to_string(),
                         final_worktree_path.to_string_lossy().to_string(),
                         row.branch_name.clone(),
                         cx,
@@ -2615,7 +2630,16 @@ impl Sidebar {
         };
 
         // Generate a new branch name for the fresh worktree.
-        let branch_name = format!("restored-{}", row.id);
+        let branch_name = {
+            use std::hash::{Hash, Hasher};
+            let mut hasher = std::collections::hash_map::DefaultHasher::new();
+            row.worktree_path.hash(&mut hasher);
+            let suffix = format!("{:x}", hasher.finish())
+                .chars()
+                .take(8)
+                .collect::<String>();
+            format!("restored-{suffix}")
+        };
         let worktree_path = main_repo.update(cx, |repo, _cx| {
             let setting = git_store::worktrees_directory_for_repo(
                 &repo.snapshot().original_repo_abs_path,
@@ -2662,7 +2686,7 @@ impl Sidebar {
         };
 
         if let Some(main_repo) = main_repo {
-            let ref_name = format!("refs/archived-worktrees/{}", row.id);
+            let ref_name = archived_worktree_ref_name(&row.worktree_path);
             let receiver = main_repo.update(cx, |repo, _cx| repo.delete_ref(ref_name));
             if let Ok(result) = receiver.await {
                 result.log_err();
@@ -2671,7 +2695,9 @@ impl Sidebar {
 
         // Delete the archived worktree record.
         store
-            .update(cx, |store, cx| store.delete_archived_worktree(row.id, cx))
+            .update(cx, |store, cx| {
+                store.delete_archived_worktree(row.worktree_path.to_string_lossy().to_string(), cx)
+            })
             .await
             .log_err();
     }
@@ -3234,7 +3260,7 @@ impl Sidebar {
         let worktree_path_str = worktree_path.to_string_lossy().to_string();
         let main_repo_path_str = main_repo_path.to_string_lossy().to_string();
 
-        let mut archived_row_id: Option<i64> = None;
+        let mut archived_worktree_path: Option<String> = None;
 
         if !commit_ok {
             // Show a prompt asking the user what to do.
@@ -3301,10 +3327,10 @@ impl Sidebar {
                 }
             };
 
-            let row_id_result = store
+            let create_result = store
                 .update(cx, |store, cx| {
                     store.create_archived_worktree(
-                        worktree_path_str,
+                        worktree_path_str.clone(),
                         main_repo_path_str,
                         branch_name,
                         commit_hash.clone(),
@@ -3313,14 +3339,14 @@ impl Sidebar {
                 })
                 .await;
 
-            match row_id_result {
-                Ok(row_id) => {
-                    archived_row_id = Some(row_id);
+            match create_result {
+                Ok(()) => {
+                    archived_worktree_path = Some(worktree_path_str);
 
                     // Create a git ref on the main repo (non-fatal if
                     // this fails — the commit hash is in the DB).
                     if let Some(main_repo) = &main_repo {
-                        let ref_name = format!("refs/archived-worktrees/{row_id}");
+                        let ref_name = archived_worktree_ref_name(&worktree_path);
                         let ref_result = main_repo
                             .update(cx, |repo, _cx| repo.update_ref(ref_name, commit_hash));
                         match ref_result.await {
@@ -3425,16 +3451,18 @@ impl Sidebar {
             } else {
                 true
             };
-            if let Some(row_id) = archived_row_id {
+            if let Some(ref archived_path) = archived_worktree_path {
                 if let Some(main_repo) = &main_repo {
-                    let ref_name = format!("refs/archived-worktrees/{row_id}");
+                    let ref_name = archived_worktree_ref_name(&worktree_path);
                     let receiver = main_repo.update(cx, |repo, _cx| repo.delete_ref(ref_name));
                     if let Ok(result) = receiver.await {
                         result.log_err();
                     }
                 }
                 store
-                    .update(cx, |store, cx| store.delete_archived_worktree(row_id, cx))
+                    .update(cx, |store, cx| {
+                        store.delete_archived_worktree(archived_path.clone(), cx)
+                    })
                     .await
                     .log_err();
             }
