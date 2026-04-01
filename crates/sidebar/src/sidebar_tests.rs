@@ -5093,6 +5093,229 @@ async fn test_archive_and_restore_single_worktree(cx: &mut TestAppContext) {
     .unwrap();
 }
 
+#[gpui::test]
+async fn test_archive_two_threads_same_path_then_restore_first(cx: &mut TestAppContext) {
+    // Regression test: archiving two different threads that use the same
+    // worktree path should create independent archived worktree records.
+    // Unarchiving the first thread should restore its own record without
+    // losing the second thread's record.
+    agent_ui::test_support::init_test(cx);
+    cx.update(|cx| {
+        cx.update_flags(false, vec!["agent-v2".into()]);
+        ThreadStore::init_global(cx);
+        ThreadMetadataStore::init_global(cx);
+        language_model::LanguageModelRegistry::test(cx);
+        prompt_store::init(cx);
+    });
+
+    let fs = FakeFs::new(cx.executor());
+
+    fs.insert_tree(
+        "/project",
+        serde_json::json!({
+            ".git": {},
+            "src": { "main.rs": "fn main() {}" },
+        }),
+    )
+    .await;
+
+    cx.update(|cx| <dyn fs::Fs>::set_global(fs.clone(), cx));
+
+    let main_project = project::Project::test(fs.clone(), ["/project".as_ref()], cx).await;
+    main_project
+        .update(cx, |p, cx| p.git_scans_complete(cx))
+        .await;
+
+    let (multi_workspace, cx) =
+        cx.add_window_view(|window, cx| MultiWorkspace::test_new(main_project.clone(), window, cx));
+
+    let sidebar = setup_sidebar(&multi_workspace, cx);
+
+    let main_workspace = multi_workspace.read_with(cx, |mw, _| mw.workspaces()[0].clone());
+    let _main_panel = add_agent_panel(&main_workspace, cx);
+
+    let store = cx.update(|_, cx| ThreadMetadataStore::global(cx));
+
+    // --- Thread A: archive with worktree at /wt-feature ---
+    let session_a = acp::SessionId::new(Arc::from("thread-a"));
+    save_thread_metadata(
+        session_a.clone(),
+        "Thread A".into(),
+        chrono::TimeZone::with_ymd_and_hms(&Utc, 2024, 1, 1, 0, 0, 0).unwrap(),
+        None,
+        PathList::new(&[std::path::PathBuf::from("/wt-feature")]),
+        cx,
+    );
+    cx.update(|_, cx| {
+        store.update(cx, |store, cx| store.archive(&session_a, cx));
+    });
+    cx.run_until_parked();
+
+    let id_a = store
+        .update_in(cx, |store, _window, cx| {
+            store.create_archived_worktree(
+                "/wt-feature".to_string(),
+                "/project".to_string(),
+                Some("feature-a".to_string()),
+                "sha-aaa".to_string(),
+                cx,
+            )
+        })
+        .await
+        .expect("create archived worktree A");
+    store
+        .update_in(cx, |store, _window, cx| {
+            store.link_thread_to_archived_worktree(session_a.0.to_string(), id_a, cx)
+        })
+        .await
+        .expect("link thread A");
+
+    // Seed a git ref for thread A's archive.
+    let ref_a = archived_worktree_ref_name(id_a);
+    fs.with_git_state(std::path::Path::new("/project/.git"), false, |state| {
+        state.refs.insert(ref_a.clone(), "sha-aaa".into());
+    })
+    .unwrap();
+
+    // --- Thread B: archive with the SAME worktree path ---
+    let session_b = acp::SessionId::new(Arc::from("thread-b"));
+    save_thread_metadata(
+        session_b.clone(),
+        "Thread B".into(),
+        chrono::TimeZone::with_ymd_and_hms(&Utc, 2024, 2, 1, 0, 0, 0).unwrap(),
+        None,
+        PathList::new(&[std::path::PathBuf::from("/wt-feature")]),
+        cx,
+    );
+    cx.update(|_, cx| {
+        store.update(cx, |store, cx| store.archive(&session_b, cx));
+    });
+    cx.run_until_parked();
+
+    let id_b = store
+        .update_in(cx, |store, _window, cx| {
+            store.create_archived_worktree(
+                "/wt-feature".to_string(),
+                "/project".to_string(),
+                Some("feature-b".to_string()),
+                "sha-bbb".to_string(),
+                cx,
+            )
+        })
+        .await
+        .expect("create archived worktree B");
+    store
+        .update_in(cx, |store, _window, cx| {
+            store.link_thread_to_archived_worktree(session_b.0.to_string(), id_b, cx)
+        })
+        .await
+        .expect("link thread B");
+
+    let ref_b = archived_worktree_ref_name(id_b);
+    fs.with_git_state(std::path::Path::new("/project/.git"), false, |state| {
+        state.refs.insert(ref_b.clone(), "sha-bbb".into());
+    })
+    .unwrap();
+
+    // Both threads should be archived, with independent IDs.
+    assert_ne!(id_a, id_b, "each archive should get its own ID");
+
+    // Verify both records exist independently.
+    let rows_a = store
+        .update_in(cx, |store, _window, cx| {
+            store.get_archived_worktrees_for_thread(session_a.0.to_string(), cx)
+        })
+        .await
+        .unwrap();
+    assert_eq!(rows_a.len(), 1);
+    assert_eq!(rows_a[0].commit_hash, "sha-aaa");
+
+    let rows_b = store
+        .update_in(cx, |store, _window, cx| {
+            store.get_archived_worktrees_for_thread(session_b.0.to_string(), cx)
+        })
+        .await
+        .unwrap();
+    assert_eq!(rows_b.len(), 1);
+    assert_eq!(rows_b[0].commit_hash, "sha-bbb");
+
+    // --- Unarchive Thread A ---
+    let metadata_a = cx.update(|_, cx| {
+        let store = ThreadMetadataStore::global(cx);
+        store
+            .read(cx)
+            .archived_entries()
+            .find(|e| e.session_id.0.as_ref() == "thread-a")
+            .cloned()
+            .expect("expected to find archived thread A")
+    });
+
+    sidebar.update_in(cx, |sidebar, window, cx| {
+        sidebar.activate_archived_thread(metadata_a, window, cx);
+    });
+    cx.run_until_parked();
+
+    // Thread A should no longer be archived.
+    cx.update(|_, cx| {
+        let store = ThreadMetadataStore::global(cx);
+        let archived_ids: Vec<_> = store
+            .read(cx)
+            .archived_entries()
+            .map(|e| e.session_id.0.to_string())
+            .collect();
+        assert!(
+            !archived_ids.contains(&"thread-a".to_string()),
+            "thread A should be unarchived, but archived list is: {archived_ids:?}"
+        );
+    });
+
+    // Thread A's archived worktree record should be cleaned up.
+    let rows_a_after = store
+        .update_in(cx, |store, _window, cx| {
+            store.get_archived_worktrees_for_thread(session_a.0.to_string(), cx)
+        })
+        .await
+        .unwrap();
+    assert!(
+        rows_a_after.is_empty(),
+        "thread A's archived worktree should be cleaned up after restore"
+    );
+
+    // Thread A's git ref should be cleaned up.
+    fs.with_git_state(std::path::Path::new("/project/.git"), false, |state| {
+        assert!(
+            !state.refs.contains_key(&ref_a),
+            "thread A's ref should be deleted, refs: {:?}",
+            state.refs
+        );
+    })
+    .unwrap();
+
+    // Thread B's record should still be intact.
+    let rows_b_after = store
+        .update_in(cx, |store, _window, cx| {
+            store.get_archived_worktrees_for_thread(session_b.0.to_string(), cx)
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        rows_b_after.len(),
+        1,
+        "thread B's archived worktree should still exist"
+    );
+    assert_eq!(rows_b_after[0].commit_hash, "sha-bbb");
+
+    // Thread B's git ref should still be intact.
+    fs.with_git_state(std::path::Path::new("/project/.git"), false, |state| {
+        assert!(
+            state.refs.contains_key(&ref_b),
+            "thread B's ref should still exist, refs: {:?}",
+            state.refs
+        );
+    })
+    .unwrap();
+}
+
 mod property_test {
     use super::*;
     use gpui::EntityId;
