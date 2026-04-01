@@ -447,7 +447,7 @@ impl ThreadMetadataStore {
         cx.background_spawn(async move { db.delete_archived_worktree(id).await })
     }
 
-    pub fn update_archived_worktree_restored(
+    pub fn set_archived_worktree_restored(
         &self,
         id: i64,
         worktree_path: String,
@@ -456,7 +456,7 @@ impl ThreadMetadataStore {
     ) -> Task<anyhow::Result<()>> {
         let db = self.db.clone();
         cx.background_spawn(async move {
-            db.update_archived_worktree_restored(id, &worktree_path, branch_name.as_deref())
+            db.set_archived_worktree_restored(id, &worktree_path, branch_name.as_deref())
                 .await
         })
     }
@@ -824,7 +824,7 @@ impl ThreadMetadataDb {
         .await
     }
 
-    pub async fn update_archived_worktree_restored(
+    pub async fn set_archived_worktree_restored(
         &self,
         id: i64,
         worktree_path: &str,
