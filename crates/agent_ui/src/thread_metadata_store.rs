@@ -648,16 +648,6 @@ impl Domain for ThreadMetadataDb {
         sql!(ALTER TABLE sidebar_threads ADD COLUMN archived INTEGER DEFAULT 0),
         sql!(
             CREATE TABLE IF NOT EXISTS archived_git_worktrees(
-                worktree_path TEXT PRIMARY KEY,
-                main_repo_path TEXT NOT NULL,
-                branch_name TEXT,
-                commit_hash TEXT NOT NULL,
-                restored INTEGER NOT NULL DEFAULT 0
-            ) STRICT;
-        ),
-        sql!(
-            DROP TABLE IF EXISTS archived_git_worktrees;
-            CREATE TABLE IF NOT EXISTS archived_git_worktrees(
                 id INTEGER PRIMARY KEY,
                 worktree_path TEXT NOT NULL,
                 main_repo_path TEXT NOT NULL,
